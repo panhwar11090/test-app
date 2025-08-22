@@ -30,23 +30,66 @@ jobs:
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
+      # Runs tests, captures console log, and still fails job on test failure
       - name: Run unit tests (CI gate)
         env:
           CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
-        run: npm run test:ci
-      # If tests fail, job stops here ❌
+        run: |
+          set -o pipefail
+          mkdir -p reports/junit reports/coverage
+          npm run test:ci | tee reports/unit-tests.log
 
-      # --- Docker build & push ---
+      # --- Always publish test artifacts (even on failure) ---
+      - name: Upload JUnit report (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-report
+          path: reports/junit/test-results.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload coverage HTML (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: reports/coverage
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload unit test console log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-console
+          path: reports/unit-tests.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Pretty summary in the Checks tab
+      - name: Publish JUnit summary (always)
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: reports/junit/test-results.xml
+          check_name: "Unit Test Report"
+          fail_on_failure: true
+
+      # --- Docker build & push (only if tests succeeded) ---
       - name: Set up Docker Buildx
+        if: success()
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
+        if: success()
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract image metadata
+        if: success()
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -56,6 +99,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push
+        if: success()
         uses: docker/build-push-action@v6
         with:
           context: .
