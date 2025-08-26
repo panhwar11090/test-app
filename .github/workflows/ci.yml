@@ -77,6 +77,38 @@ jobs:
           check_name: "Unit Test Report"
           fail_on_failure: true
 
+            # ----- E2E against the built app (black-box) -----
+      - name: Build Angular (prod) for E2E
+        if: success()
+        run: npm run build -- --configuration=production
+
+      - name: Setup Chrome for Cypress
+        if: success()
+        id: chrome_e2e
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Serve dist for E2E
+        if: success()
+        run: npx http-server dist/test-app -p 8080 -s &
+
+      - name: Run Cypress E2E
+        if: success()
+        env:
+          CHROME_BIN: ${{ steps.chrome_e2e.outputs.chrome-path }}
+          CYPRESS_baseUrl: http://localhost:8080
+        run: npx cypress run --browser chrome --headless
+
+      - name: Upload Cypress artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-artifacts
+          path: |
+            cypress/screenshots
+            cypress/videos
+          if-no-files-found: ignore
+          retention-days: 14
+
       # --- Docker build & push (only if tests succeeded) ---
       - name: Set up Docker Buildx
         if: success()
