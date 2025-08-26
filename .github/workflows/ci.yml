@@ -12,26 +12,42 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write
+      checks: write   # needed for the JUnit summary check
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # --- Node setup & tests ---
-      - name: Use Node 20
+      # --- Node setup & deps (with cache + retries) ---
+      - name: Use Node 20 (with npm cache)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
 
-      - name: Install deps
-        run: npm ci
+      - name: Install deps (cached, retries, mirror fallback)
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/"
+          NPM_CONFIG_FETCH_RETRIES: "5"
+          NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: "20000"
+          NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: "120000"
+          NPM_CONFIG_PREFER_OFFLINE: "true"
+          NPM_CONFIG_CACHE_MIN: "86400"
+        run: |
+          npm ci || \
+          (echo "retry 1..." && sleep 15 && npm ci) || \
+          (echo "retry 2..." && sleep 45 && npm ci) || \
+          (echo "switch to mirror..." && npm config set registry https://registry.npmmirror.com && npm ci)
 
+      # --- Chrome for Karma & Cypress ---
       - name: Setup Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
-      # Runs tests, captures console log, and still fails job on test failure
+      # --- Unit tests (Karma/Jasmine) ---
       - name: Run unit tests (CI gate)
         env:
           CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
@@ -68,7 +84,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      # Pretty summary in the Checks tab
       - name: Publish JUnit summary (always)
         if: always()
         uses: mikepenz/action-junit-report@v4
@@ -76,27 +91,49 @@ jobs:
           report_paths: reports/junit/test-results.xml
           check_name: "Unit Test Report"
           fail_on_failure: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ----- E2E against the built app (black-box) -----
+      # ----- E2E against built app (Cypress) -----
       - name: Build Angular (prod) for E2E
         if: success()
         run: npm run build -- --configuration=production
 
-      - name: Setup Chrome for Cypress
+      - name: Pick dist root (debug)
         if: success()
-        id: chrome_e2e
-        uses: browser-actions/setup-chrome@v1
+        run: |
+          echo "Searching for index.html under dist..."
+          find dist -maxdepth 3 -name index.html -print || true
+          if [ -f dist/test-app/index.html ]; then
+            DIST_ROOT=dist/test-app
+          elif [ -f dist/test-app/browser/index.html ]; then
+            DIST_ROOT=dist/test-app/browser
+          else
+            echo "No index.html found under dist/"; exit 1
+          fi
+          echo "DIST_ROOT=$DIST_ROOT" >> $GITHUB_ENV
+          echo "Chosen DIST_ROOT=$DIST_ROOT"
+
+      - name: Cache Cypress binary
+        if: success()
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Cypress
+          key: cypress-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
 
       - name: Serve dist for E2E
         if: success()
-        run: npx http-server dist/test-app -p 8080 &
+        run: npx http-server "$DIST_ROOT" -p 8080 -a 127.0.0.1 -s >/dev/null 2>&1 &
 
-      - name: Wait for server to be ready
+      - name: Wait for server to be ready (port)
         if: success()
-        run: npx wait-on http://127.0.0.1:8080/index.html
+        run: |
+          npx wait-on tcp:127.0.0.1:8080 --timeout 180000
+          curl -I http://127.0.0.1:8080 || true
 
       - name: Run Cypress E2E
         if: success()
+        env:
+          CYPRESS_BROWSER_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
           npx cypress run --browser chrome --headless \
             --config baseUrl=http://127.0.0.1:8080,retries=2,defaultCommandTimeout=20000
@@ -112,7 +149,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      # --- Docker build & push (only if tests succeeded) ---
+      # --- Docker build & push (only if tests + e2e succeeded) ---
       - name: Set up Docker Buildx
         if: success()
         uses: docker/setup-buildx-action@v3
