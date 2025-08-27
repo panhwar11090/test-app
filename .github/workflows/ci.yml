@@ -4,7 +4,7 @@ on:
   push:
     branches: [ "main" ]
 
-# Cancel previous in-progress runs of this workflow on the same ref
+# cancel older in-flight runs on same branch
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -13,64 +13,40 @@ env:
   IMAGE_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/test-app
 
 jobs:
-  test-build-push:
+  # -------------------------
+  # 1) UNIT TESTS (parallel)
+  # -------------------------
+  unit_tests:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write   # for JUnit summary check
-
+      checks: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- Run metadata (used in artifacts & summaries) ----
-      - name: Set run metadata
-        run: |
-          echo "BUNDLE_ID=${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}" >> $GITHUB_ENV
-          mkdir -p reports/junit reports/coverage reports/logs reports/cypress-junit
-          echo "Started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > reports/_meta.txt
-
-      # --- Node setup & deps (with cache + retries) ---
-      - name: Use Node 20 (with npm cache)
+      - name: Node 20 (with npm cache)
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: 20
+          cache: npm
           cache-dependency-path: '**/package-lock.json'
 
-      - name: Install deps (cached, retries, mirror fallback)
-        env:
-          NPM_CONFIG_AUDIT: "false"
-          NPM_CONFIG_FUND: "false"
-          NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/"
-          NPM_CONFIG_FETCH_RETRIES: "5"
-          NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: "20000"
-          NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: "120000"
-          NPM_CONFIG_PREFER_OFFLINE: "true"
-          NPM_CONFIG_CACHE_MIN: "86400"
-        run: |
-          set -o pipefail
-          (npm ci || \
-            (echo "retry 1..." && sleep 15 && npm ci) || \
-            (echo "retry 2..." && sleep 45 && npm ci) || \
-            (echo "switch to mirror..." && npm config set registry https://registry.npmmirror.com && npm ci)) \
-            | tee reports/logs/npm-ci.log
+      - name: Install deps
+        run: npm ci
 
-      # --- Chrome for Karma & Cypress ---
       - name: Setup Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
-      # --- Unit tests (Karma/Jasmine) ---
-      # Ensure your karma config outputs JUnit to reports/junit/ and coverage to reports/coverage/
-      - name: Run unit tests (CI gate)
+      - name: Run unit tests (JUnit + coverage)
         env:
           CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
         run: |
-          set -o pipefail
+          mkdir -p reports/junit reports/coverage
+          # expect karma to write junit xml into reports/junit and coverage html into reports/coverage
           npm run test:ci | tee reports/unit-tests.log
 
-      # --- Summarize unit tests (always shows a check in PR/run) ---
       - name: Publish JUnit summary (always)
         if: always()
         uses: mikepenz/action-junit-report@v4
@@ -78,20 +54,43 @@ jobs:
           report_paths: reports/junit/**/*.xml
           check_name: "Unit Test Report"
           fail_on_failure: true
-          github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ----- E2E against built app (Cypress) -----
-      - name: Build Angular (prod) for E2E
-        if: success()
-        run: |
-          set -o pipefail
-          npm run build -- --configuration=production | tee reports/logs/ng-build.log
+      - name: Upload unit artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-artifacts-${{ github.run_number }}-${{ github.sha }}
+          path: |
+            reports/junit/**
+            reports/coverage/**
+            reports/unit-tests.log
+          if-no-files-found: ignore
+          retention-days: 30
 
-      - name: Pick dist root (debug)
-        if: success()
+  # -------------------------
+  # 2) E2E TESTS (parallel)
+  # -------------------------
+  e2e_tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 20 (with npm cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build Angular (prod)
+        run: npm run build -- --configuration=production
+
+      - name: Pick dist root
         run: |
-          echo "Searching for index.html under dist..."
-          find dist -maxdepth 3 -name index.html -print || true
           if [ -f dist/test-app/index.html ]; then
             echo "DIST_ROOT=dist/test-app" >> $GITHUB_ENV
           elif [ -f dist/test-app/browser/index.html ]; then
@@ -102,64 +101,66 @@ jobs:
           echo "Chosen DIST_ROOT=$DIST_ROOT"
 
       - name: Cache Cypress binary
-        if: success()
         uses: actions/cache@v4
         with:
           path: ~/.cache/Cypress
           key: cypress-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
 
+      - name: Setup Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+
       - name: Serve dist for E2E
-        if: success()
         run: npx http-server "$DIST_ROOT" -p 8080 -a 127.0.0.1 -s >/dev/null 2>&1 &
 
-      - name: Wait for server to be ready (port)
-        if: success()
+      - name: Wait for server to be ready
         run: |
           npx wait-on tcp:127.0.0.1:8080 --timeout 180000
           curl -I http://127.0.0.1:8080 || true
 
-      - name: Run Cypress E2E (with JUnit)
-        if: success()
+      - name: Run Cypress (JUnit + videos)
         env:
           CYPRESS_BROWSER_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
+          mkdir -p reports/cypress-junit
           npx cypress run --browser chrome --headless \
             --reporter junit \
             --reporter-options "mochaFile=reports/cypress-junit/results-[hash].xml,toConsole=false" \
             --config baseUrl=http://127.0.0.1:8080,retries=2,defaultCommandTimeout=20000
 
-      # --- Upload everything for this run (one bundle) ---
-      - name: Upload all artifacts (always)
+      - name: Upload e2e artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: artifacts-${{ env.BUNDLE_ID }}
+          name: e2e-artifacts-${{ github.run_number }}-${{ github.sha }}
           path: |
-            reports/_meta.txt
-            reports/junit/**/*.xml
-            reports/coverage/**
-            reports/unit-tests.log
-            reports/logs/**
-            reports/cypress-junit/**/*.xml
+            reports/cypress-junit/**
             cypress/screenshots/**
             cypress/videos/**
           if-no-files-found: ignore
           retention-days: 30
 
-      # --- Docker build & push (only if tests + e2e succeeded) ---
+  # ------------------------------------------------------
+  # 3) BUILD & PUSH (runs ONLY if both tests succeeded)
+  # ------------------------------------------------------
+  build_push:
+    needs: [unit_tests, e2e_tests]
+    if: ${{ needs.unit_tests.result == 'success' && needs.e2e_tests.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
-        if: success()
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
-        if: success()
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract image metadata
-        if: success()
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -169,7 +170,6 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push
-        if: success()
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -178,29 +178,25 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      # --- Nice one-glance summary in the run (always) ---
       - name: Publish run summary
         if: always()
         run: |
           {
-            echo "## CI Logbook — $BUNDLE_ID"
+            echo "## CI Logbook — ${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
             echo ""
             echo "**Commit:** \`${GITHUB_SHA}\`  •  **Run #:** ${GITHUB_RUN_NUMBER}"
             echo ""
             echo "### Artifacts"
-            echo "- Download: \`artifacts-${BUNDLE_ID}\`"
-            echo ""
-            echo "### Contents"
-            echo "- Unit test JUnit: \`reports/junit/\`"
-            echo "- Coverage HTML: \`reports/coverage/index.html\`"
-            echo "- Cypress JUnit: \`reports/cypress-junit/\`"
-            echo "- Screenshots/Videos: \`cypress/*\`"
-            echo "- Build logs: \`reports/logs/\` (npm-ci.log, ng-build.log)"
+            echo "- Unit: \`unit-artifacts-${GITHUB_RUN_NUMBER}-${GITHUB_SHA}\`"
+            echo "- E2E : \`e2e-artifacts-${GITHUB_RUN_NUMBER}-${GITHUB_SHA}\`"
           } >> $GITHUB_STEP_SUMMARY
 
-  # --- Keep artifacts for only the latest 7 completed runs on main ---
+  # ------------------------------------------------------
+  # 4) PRUNE ARTIFACTS (keep latest 7 runs on main)
+  # runs regardless of build_push being skipped/failed
+  # ------------------------------------------------------
   prune_old_artifacts:
-    needs: test-build-push
+    needs: [unit_tests, e2e_tests, build_push]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     permissions:
@@ -212,10 +208,9 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
-            const wfName = context.workflow;       // e.g. "CI (Angular) -> Docker Hub"
+            const wfName = context.workflow;  // "CI (Angular) -> Docker Hub"
             const branch = 'main';
 
-            // Get completed runs on main and keep only this workflow's runs
             const allRuns = await github.paginate(
               github.rest.actions.listWorkflowRunsForRepo,
               { owner, repo, branch, status: 'completed', per_page: 100 }
@@ -223,7 +218,7 @@ jobs:
             const runs = allRuns.filter(r => r.name === wfName);
 
             const keep = 7;
-            const old = runs.slice(keep);          // runs are newest-first
+            const old = runs.slice(keep); // newest-first
             for (const run of old) {
               const arts = await github.paginate(
                 github.rest.actions.listWorkflowRunArtifacts,
@@ -234,4 +229,3 @@ jobs:
                 core.info(`Deleted artifact ${a.name} from run #${run.run_number}`);
               }
             }
-
