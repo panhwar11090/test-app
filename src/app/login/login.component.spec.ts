@@ -22,7 +22,7 @@ describe('LoginComponent', () => {
 
   it('should show success message for correct credentials', () => {
     component.username = 'huzaifa';
-    component.password = 'huzaifa1234';
+    component.password = 'huzaifa123';
     component.onLogin();
 
     expect(component.message).toContain('Login successful');
