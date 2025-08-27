@@ -4,7 +4,6 @@ on:
   push:
     branches: [ "main" ]
 
-# cancel older in-flight runs on same branch
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -13,28 +12,20 @@ env:
   IMAGE_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/test-app
 
 jobs:
-  # -------------------------
-  # 1) UNIT TESTS (parallel)
-  # -------------------------
+  # 1) UNIT TESTS (runs in parallel with e2e_tests)
   unit_tests:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       checks: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Node 20 (with npm cache)
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: '**/package-lock.json'
-
-      - name: Install deps
-        run: npm ci
-
+      - run: npm ci
       - name: Setup Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
@@ -43,8 +34,8 @@ jobs:
         env:
           CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
         run: |
+          set -o pipefail
           mkdir -p reports/junit reports/coverage
-          # expect karma to write junit xml into reports/junit and coverage html into reports/coverage
           npm run test:ci | tee reports/unit-tests.log
 
       - name: Publish JUnit summary (always)
@@ -67,27 +58,18 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-  # -------------------------
-  # 2) E2E TESTS (parallel)
-  # -------------------------
+  # 2) E2E TESTS (runs in parallel with unit_tests)
   e2e_tests:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Node 20 (with npm cache)
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: '**/package-lock.json'
-
-      - name: Install deps
-        run: npm ci
-
-      - name: Build Angular (prod)
-        run: npm run build -- --configuration=production
+      - run: npm ci
+      - run: npm run build -- --configuration=production
 
       - name: Pick dist root
         run: |
@@ -100,8 +82,7 @@ jobs:
           fi
           echo "Chosen DIST_ROOT=$DIST_ROOT"
 
-      - name: Cache Cypress binary
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/Cypress
           key: cypress-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
@@ -113,7 +94,7 @@ jobs:
       - name: Serve dist for E2E
         run: npx http-server "$DIST_ROOT" -p 8080 -a 127.0.0.1 -s >/dev/null 2>&1 &
 
-      - name: Wait for server to be ready
+      - name: Wait for server
         run: |
           npx wait-on tcp:127.0.0.1:8080 --timeout 180000
           curl -I http://127.0.0.1:8080 || true
@@ -122,11 +103,12 @@ jobs:
         env:
           CYPRESS_BROWSER_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
+          set -o pipefail
           mkdir -p reports/cypress-junit
           npx cypress run --browser chrome --headless \
             --reporter junit \
             --reporter-options "mochaFile=reports/cypress-junit/results-[hash].xml,toConsole=false" \
-            --config baseUrl=http://127.0.0.1:8080,retries=2,defaultCommandTimeout=20000
+            --config baseUrl=http://127.0.0.1:8080,retries=2,defaultCommandTimeout=20000 | tee reports/cypress.log
 
       - name: Upload e2e artifacts (always)
         if: always()
@@ -135,42 +117,47 @@ jobs:
           name: e2e-artifacts-${{ github.run_number }}-${{ github.sha }}
           path: |
             reports/cypress-junit/**
+            reports/cypress.log
             cypress/screenshots/**
             cypress/videos/**
           if-no-files-found: ignore
           retention-days: 30
 
-  # ------------------------------------------------------
-  # 3) BUILD & PUSH (runs ONLY if both tests succeeded)
-  # ------------------------------------------------------
-  build_push:
+  # 3) GATE (single place to fail the workflow if any tests failed)
+  gate:
     needs: [unit_tests, e2e_tests]
-    if: ${{ needs.unit_tests.result == 'success' && needs.e2e_tests.result == 'success' }}
+    runs-on: ubuntu-latest
+    if: always()  # always run to evaluate results
+    steps:
+      - name: Ensure both test suites passed
+        run: |
+          echo "unit_tests: ${{ needs.unit_tests.result }}"
+          echo "e2e_tests : ${{ needs.e2e_tests.result }}"
+          if [ "${{ needs.unit_tests.result }}" != "success" ] || [ "${{ needs.e2e_tests.result }}" != "success" ]; then
+            echo "❌ One or more test jobs failed. Stopping pipeline."
+            exit 1
+          fi
+          echo "✅ Both test jobs passed. Proceed."
+
+  # 4) BUILD & PUSH (only runs if gate passed)
+  build_push:
+    needs: [gate]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract image metadata
-        id: meta
+      - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_REPO }}
           tags: |
             type=sha
             type=raw,value=latest
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
@@ -178,23 +165,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Publish run summary
-        if: always()
-        run: |
-          {
-            echo "## CI Logbook — ${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
-            echo ""
-            echo "**Commit:** \`${GITHUB_SHA}\`  •  **Run #:** ${GITHUB_RUN_NUMBER}"
-            echo ""
-            echo "### Artifacts"
-            echo "- Unit: \`unit-artifacts-${GITHUB_RUN_NUMBER}-${GITHUB_SHA}\`"
-            echo "- E2E : \`e2e-artifacts-${GITHUB_RUN_NUMBER}-${GITHUB_SHA}\`"
-          } >> $GITHUB_STEP_SUMMARY
-
-  # ------------------------------------------------------
-  # 4) PRUNE ARTIFACTS (keep latest 7 runs on main)
-  # runs regardless of build_push being skipped/failed
-  # ------------------------------------------------------
+  # 5) PRUNE ARTIFACTS (keep latest 7 runs on main)
   prune_old_artifacts:
     needs: [unit_tests, e2e_tests, build_push]
     runs-on: ubuntu-latest
@@ -208,17 +179,15 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
-            const wfName = context.workflow;  // "CI (Angular) -> Docker Hub"
+            const wfName = context.workflow;
             const branch = 'main';
-
             const allRuns = await github.paginate(
               github.rest.actions.listWorkflowRunsForRepo,
               { owner, repo, branch, status: 'completed', per_page: 100 }
             );
             const runs = allRuns.filter(r => r.name === wfName);
-
             const keep = 7;
-            const old = runs.slice(keep); // newest-first
+            const old = runs.slice(keep);
             for (const run of old) {
               const arts = await github.paginate(
                 github.rest.actions.listWorkflowRunArtifacts,
