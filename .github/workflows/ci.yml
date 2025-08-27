@@ -195,30 +195,38 @@ jobs:
 
   # --- Keep artifacts for only the latest 7 completed runs on main ---
   prune_old_artifacts:
-    needs: test-build-push
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    permissions:
-      actions: write
-    steps:
-      - name: Prune artifacts, keep last 7 runs on main
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo  = context.repo.repo;
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRuns,
-              { owner, repo, workflow_id: context.workflow, branch: 'main', status: 'completed', per_page: 100 }
+  needs: test-build-push
+  runs-on: ubuntu-latest
+  if: github.ref == 'refs/heads/main'
+  permissions:
+    actions: write
+  steps:
+    - name: Prune artifacts, keep last 7 runs of this workflow on main
+        # Note: we list all runs for the repo, then filter by workflow NAME
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const owner = context.repo.owner;
+          const repo  = context.repo.repo;
+          const wfName = context.workflow;       // e.g. "CI (Angular) → Docker Hub"
+          const branch = 'main';
+
+          // Get completed runs on main and keep only this workflow's runs
+          const allRuns = await github.paginate(
+            github.rest.actions.listWorkflowRunsForRepo,
+            { owner, repo, branch, status: 'completed', per_page: 100 }
+          );
+          const runs = allRuns.filter(r => r.name === wfName);
+
+          const keep = 7;
+          const old = runs.slice(keep);          // runs are returned newest-first
+          for (const run of old) {
+            const arts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              { owner, repo, run_id: run.id, per_page: 100 }
             );
-            const keep = 7;
-            const old = runs.slice(keep);
-            for (const run of old) {
-              const arts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
-                owner, repo, run_id: run.id, per_page: 100
-              });
-              for (const a of arts) {
-                await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
-                core.info(`Deleted artifact ${a.name} from run #${run.run_number}`);
-              }
+            for (const a of arts) {
+              await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
+              core.info(`Deleted artifact ${a.name} from run #${run.run_number}`);
             }
+          }
